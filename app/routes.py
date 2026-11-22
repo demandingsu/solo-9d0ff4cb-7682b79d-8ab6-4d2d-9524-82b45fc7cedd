@@ -1,8 +1,11 @@
-"""HTTP 路由：网页、JSON API、阅览目录 CSV。
+"""HTTP 路由：网页、JSON API、阅览目录 CSV、转写上传与检索。
 
 并发正确性：所有变更在同一事务内“先核对、后落库”。
 BEGIN IMMEDIATE 让并发写者在 SQLite 写锁上排队，核对读到的就是
 实际入库时刻的证据状态，杜绝两个窗口同时提交时的核对竞态（TOCTOU）。
+
+检索是纯读，但同样包在一个读事务里：转写与页序证据必须取自同一个
+已提交快照，避免查询过程中恰好有重扫/补记提交而读到拼接的状态。
 """
 import csv
 import io
@@ -11,17 +14,22 @@ from flask import Blueprint, jsonify, render_template, request
 
 from .db import get_db
 from .logic import (
+    TranscriptEntry,
     find_cycle,
     load_edges,
     load_pages,
+    load_transcripts,
     note_edge,
+    search_transcripts,
     unique_topological_order,
+    validate_transcripts,
 )
 
 bp = Blueprint("main", __name__)
 
 # CSV 首行若是这些表头则跳过
 HEADER_ALIASES = {"page_id", "page", "id", "pageid", "纸页标识", "页标识", "页面"}
+TEXT_ALIASES = {"text", "transcript", "content", "全文", "转写", "转写全文", "正文"}
 
 
 def parse_manifest(text):
@@ -40,6 +48,33 @@ def parse_manifest(text):
                 continue
         pages.append(cell)
     return pages
+
+
+def parse_transcripts(text):
+    """解析转写 CSV：第一列纸页标识，其余列按逗号接回为转写全文。
+
+    首行若形如表头（第一列像页标识、第二列像转写）则跳过。
+    正文含逗号时即使未加引号也能原样保留；含换行需按 CSV 引号规则。
+    """
+    entries = []
+    problems = []
+    first = True
+    for line_no, row in enumerate(csv.reader(io.StringIO(text)), 1):
+        if not row or all(not cell.strip() for cell in row):
+            continue
+        if first:
+            first = False
+            if (
+                row[0].strip().lower() in HEADER_ALIASES
+                and len(row) > 1
+                and row[1].strip().lower() in TEXT_ALIASES
+            ):
+                continue
+        if len(row) < 2:
+            problems.append(f"第 {line_no} 条记录：需为「纸页标识,转写全文」两列")
+            continue
+        entries.append(TranscriptEntry(row[0], ",".join(row[1:])))
+    return entries, problems
 
 
 def cycle_payload(cycle):
@@ -67,8 +102,14 @@ def current_state(db):
         {"id": n["id"], "a": n["page_a"], "b": n["page_b"], "created_at": n["created_at"]}
         for n in db.execute("SELECT * FROM notes ORDER BY id")
     ]
+    transcripts = [
+        {"page_id": t["page_id"], "chars": t["chars"], "updated_at": t["updated_at"]}
+        for t in db.execute(
+            "SELECT page_id, length(text) AS chars, updated_at FROM transcripts ORDER BY page_id"
+        )
+    ]
     order, pair = unique_topological_order(load_pages(db), load_edges(db))
-    return segments, notes, order, pair
+    return segments, notes, transcripts, order, pair
 
 
 @bp.get("/")
@@ -79,14 +120,97 @@ def index():
 @bp.get("/api/state")
 def api_state():
     db = get_db()
-    segments, notes, order, pair = current_state(db)
+    segments, notes, transcripts, order, pair = current_state(db)
     return jsonify(
         ok=True,
         segments=segments,
         notes=notes,
+        transcripts=transcripts,
         unique=order is not None,
         order=order,
         undetermined_pair=list(pair) if pair else None,
+    )
+
+
+@bp.post("/api/transcripts")
+def upload_transcripts():
+    """上传转写 CSV，按页替换本批涉及的纸页。
+
+    先整批校验（未知纸页 / 同批重号 / 列数不足），任一条不合则整批
+    退回，一条都不入库；全部通过才在同一事务里逐页覆盖。
+    """
+    upload = request.files.get("file")
+    if upload is None:
+        return jsonify(ok=False, error="缺少 CSV 文件"), 400
+    try:
+        text = upload.stream.read().decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return jsonify(ok=False, error="CSV 需为 UTF-8 编码"), 400
+
+    entries, problems = parse_transcripts(text)
+    if problems:
+        return jsonify(ok=False, error="转写 CSV 格式有误，已整批退回", problems=problems), 400
+    if not entries:
+        return jsonify(ok=False, error="CSV 为空：每行「纸页标识,转写全文」"), 400
+
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        accepted, errors = validate_transcripts(entries, load_pages(db))
+        if errors:
+            db.execute("ROLLBACK")
+            return (
+                jsonify(
+                    ok=False,
+                    error="转写批次含未知纸页或同批重号，已整批退回",
+                    problems=errors,
+                ),
+                400,
+            )
+        db.executemany(
+            """INSERT INTO transcripts (page_id, text) VALUES (?, ?)
+               ON CONFLICT(page_id) DO UPDATE SET
+                 text = excluded.text,
+                 updated_at = datetime('now')""",
+            [(e.page_id, e.text) for e in accepted],
+        )
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return jsonify(ok=True, pages=[e.page_id for e in accepted], rows=len(accepted)), 200
+
+
+@bp.get("/api/search")
+def search():
+    """按字面检索转写，返回页内命中与确定的跨页命中。
+
+    整个查询（转写 + 页序证据）在一个只读事务快照里完成，保证二者
+    来自同一个已提交状态；即使全册页序未定也照常检索。
+    """
+    query = request.args.get("q", "")
+    if not query:
+        return jsonify(ok=False, error="请给出检索词"), 400
+
+    db = get_db()
+    db.execute("BEGIN")
+    try:
+        pages = load_pages(db)
+        edges = load_edges(db)
+        transcripts = load_transcripts(db)
+    finally:
+        db.execute("COMMIT")  # 只读事务，提交即结束快照
+
+    # 同一事务快照内读齐转写与页序证据，再在快照外做纯计算
+    hits = search_transcripts(query, pages, edges, transcripts)
+    page_hits = [h for h in hits if h["kind"] == "page"]
+    cross_hits = [h for h in hits if h["kind"] == "cross_page"]
+    return jsonify(
+        ok=True,
+        query=query,
+        page_hits=page_hits,
+        cross_page_hits=cross_hits,
+        total=len(hits),
     )
 
 

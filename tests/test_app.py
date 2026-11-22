@@ -1,4 +1,6 @@
-"""端到端测试：段上传/重扫、补记幂等、成环退回、目录供给、并发核对。"""
+"""端到端测试：段上传/重扫、补记幂等、成环退回、目录供给、并发核对、
+转写上传与检索（页内命中、跨页紧邻、整批退回、快照一致）。"""
+import csv
 import io
 import threading
 
@@ -24,6 +26,21 @@ def upload(client, name, pages, header=True):
         "file": (io.BytesIO("\n".join(lines).encode("utf-8")), f"{name}.csv"),
     }
     return client.post("/api/segments", data=data, content_type="multipart/form-data")
+
+
+def upload_transcripts(client, rows, header=True):
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    if header:
+        writer.writerow(["page_id", "text"])
+    for row in rows:
+        writer.writerow(row)
+    data = {"file": (io.BytesIO(out.getvalue().encode("utf-8")), "transcripts.csv")}
+    return client.post("/api/transcripts", data=data, content_type="multipart/form-data")
+
+
+def search(client, q):
+    return client.get("/api/search", query_string={"q": q})
 
 
 def note(client, a, b):
@@ -220,3 +237,246 @@ def test_concurrent_rescans_of_same_segment_serialize(app):
     segs = state(client)["segments"]
     assert len(segs) == 1
     assert segs[0]["pages"] in (["A", "X", "B"], ["A", "Y", "B"])
+
+
+# ---------- 转写上传：按页替换、整批退回 ----------
+
+def test_transcript_upload_and_page_hit(client):
+    upload(client, "S1", ["A", "B"])
+    r = upload_transcripts(client, [["A", "山高月小，水落石出"], ["B", "清风徐来"]])
+    assert r.status_code == 200 and r.get_json()["pages"] == ["A", "B"]
+
+    s = state(client)
+    assert [t["page_id"] for t in s["transcripts"]] == ["A", "B"]
+
+    r = search(client, "月小")
+    assert r.status_code == 200
+    hits = r.get_json()["page_hits"]
+    assert len(hits) == 1 and hits[0]["page_id"] == "A"
+    assert "山高月小，水落石出" in hits[0]["snippet"]
+
+
+def test_transcript_is_literal_and_case_sensitive(client):
+    upload(client, "S1", ["A"])
+    upload_transcripts(client, [["A", "Abc ABC"]])
+    assert search(client, "abc").get_json()["total"] == 0
+    assert search(client, "ABC").get_json()["total"] == 1
+
+
+def test_transcript_upload_replaces_only_listed_pages(client):
+    upload(client, "S1", ["A", "B"])
+    upload_transcripts(client, [["A", "旧文"], ["B", "乙页"]])
+    upload_transcripts(client, [["A", "新文"]])
+    assert search(client, "旧文").get_json()["total"] == 0
+    assert search(client, "新文").get_json()["total"] == 1
+    assert search(client, "乙页").get_json()["total"] == 1  # 未列出的页保留
+
+
+def test_transcript_unknown_page_rejects_whole_batch(client):
+    upload(client, "S1", ["A", "B"])
+    r = upload_transcripts(client, [["A", "甲"], ["ZZ", "未知"]])
+    assert r.status_code == 400
+    assert any("未知纸页「ZZ」" in p for p in r.get_json()["problems"])
+    assert state(client)["transcripts"] == []  # A 也未入库
+
+
+def test_transcript_duplicate_page_rejects_whole_batch(client):
+    upload(client, "S1", ["A", "B"])
+    r = upload_transcripts(client, [["A", "第一次"], ["A", "第二次"], ["B", "乙"]])
+    assert r.status_code == 400
+    assert any("重复" in p for p in r.get_json()["problems"])
+    assert state(client)["transcripts"] == []
+
+
+def test_transcript_malformed_row_rejects_whole_batch(client):
+    upload(client, "S1", ["A", "B"])
+    data = {"file": (io.BytesIO(b"A\nB,x\n"), "t.csv")}
+    r = client.post("/api/transcripts", data=data, content_type="multipart/form-data")
+    assert r.status_code == 400
+    assert state(client)["transcripts"] == []
+
+
+def test_transcript_text_with_commas_and_quoted_newlines(client):
+    upload(client, "S1", ["A", "B"])
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    writer.writerow(["page_id", "text"])
+    writer.writerow(["A", "第一行\n第二行，带逗号"])
+    writer.writerow(["B", "乙"])
+    data = {"file": (io.BytesIO(out.getvalue().encode("utf-8")), "t.csv")}
+    assert client.post(
+        "/api/transcripts", data=data, content_type="multipart/form-data"
+    ).status_code == 200
+    hit = search(client, "第二行，带逗号").get_json()["page_hits"]
+    assert len(hit) == 1 and hit[0]["page_id"] == "A"
+
+
+# ---------- 跨页检索 ----------
+
+def test_cross_page_hit_requires_forced_adjacency(client):
+    upload(client, "S1", ["A", "B"])
+    upload_transcripts(client, [["A", "……山高月"], ["B", "小，水落石出……"]])
+    payload = search(client, "月小").get_json()
+    assert len(payload["cross_page_hits"]) == 1
+    hit = payload["cross_page_hits"][0]
+    assert hit["pages"] == ["A", "B"]
+    assert "山高月" in hit["snippet"] and "小，水落石出" in hit["snippet"]
+
+
+def test_cross_page_reverse_direction_not_reported(client):
+    upload(client, "S1", ["A", "B"])  # A 先于 B
+    upload_transcripts(client, [["A", "cd开头"], ["B", "结尾ab"]])
+    payload = search(client, "abcd").get_json()  # B 的末尾接 A 的开头
+    assert payload["cross_page_hits"] == []
+    assert payload["page_hits"] == []
+
+
+def test_cross_page_needs_order_not_full_catalog(client):
+    """全册页序不唯一，但两页在所有页序里都紧挨 → 跨页命中照供。"""
+    upload(client, "S1", ["A", "B"])
+    upload(client, "S2", ["C"])  # 单页段，本身不产生先后边
+    upload(client, "S3", ["D"])
+    note(client, "B", "C")
+    note(client, "B", "D")  # C、D 都固定在 B 之后，但二者可互换
+    assert state(client)["unique"] is False
+    upload_transcripts(client, [["A", "前文ab"], ["B", "cd后文"]])
+    payload = search(client, "abcd").get_json()
+    assert len(payload["cross_page_hits"]) == 1
+    assert payload["cross_page_hits"][0]["pages"] == ["A", "B"]
+
+
+def test_untranscribed_page_between_blocks_cross_page(client):
+    upload(client, "S1", ["A", "X", "B"])  # X 未转写但强制夹在中间
+    upload_transcripts(client, [["A", "前文ab"], ["B", "cd后文"]])
+    payload = search(client, "abcd").get_json()
+    assert payload["page_hits"] == []
+    assert payload["cross_page_hits"] == []
+
+
+def test_unrelated_untranscribed_page_can_be_inserted(client):
+    """A、B 有先后但 X 与二者无关，可被排到 A、B 之间 → 不算紧挨。"""
+    upload(client, "S1", ["A", "B"])
+    upload(client, "S2", ["X", "Y"])  # X、Y 与 A、B 无先后
+    upload_transcripts(client, [["A", "前文ab"], ["B", "cd后文"]])
+    assert search(client, "abcd").get_json()["cross_page_hits"] == []
+
+
+def test_unrelated_page_outside_pair_does_not_block(client):
+    upload(client, "S1", ["A", "B", "X"])  # X 确定在 B 之后
+    upload_transcripts(client, [["A", "前文ab"], ["B", "cd后文"]])
+    payload = search(client, "abcd").get_json()
+    assert len(payload["cross_page_hits"]) == 1
+
+
+def test_page_hit_works_when_order_undetermined(client):
+    upload(client, "S1", ["A", "B"])
+    upload(client, "S2", ["C", "D"])
+    upload_transcripts(client, [["C", "内有月小二字"]])
+    payload = search(client, "月小").get_json()
+    assert payload["page_hits"][0]["page_id"] == "C"
+
+
+def test_rescan_without_transcript_change_updates_cross_page(client):
+    """重扫与补记即使没改转写，也要让检索反映新的相邻关系。"""
+    upload(client, "S1", ["A", "B"])
+    upload(client, "S2", ["X", "Y"])  # X、Y 可插到 A、B 之间
+    upload_transcripts(client, [["A", "前文ab"], ["B", "cd后文"]])
+    assert search(client, "abcd").get_json()["cross_page_hits"] == []
+
+    note(client, "B", "X")  # A→B→X→Y：X 被推到 B 之后
+    payload = search(client, "abcd").get_json()
+    assert len(payload["cross_page_hits"]) == 1
+
+    upload(client, "S2", ["X", "A"])  # 重扫：X→A→B→Y，A、B 仍紧挨
+    payload = search(client, "abcd").get_json()
+    assert len(payload["cross_page_hits"]) == 1
+
+
+def test_rescan_can_remove_adjacency(client):
+    upload(client, "S1", ["A", "B"])
+    upload_transcripts(client, [["A", "前文ab"], ["B", "cd后文"]])
+    assert len(search(client, "abcd").get_json()["cross_page_hits"]) == 1
+
+    upload(client, "S1", ["A", "X", "B"])  # 重扫插入未转写页
+    assert search(client, "abcd").get_json()["cross_page_hits"] == []
+
+
+def test_search_snapshot_sees_one_committed_state(app, monkeypatch):
+    """查询中途有提交：本次查询仍用开始时的同一快照，不拼两个状态。"""
+    import sqlite3
+
+    from app import routes
+
+    c = app.test_client()
+    upload(c, "S1", ["A", "B"])
+    upload_transcripts(c, [["A", "前文ab"], ["B", "cd后文"]])
+    assert len(search(c, "abcd").get_json()["cross_page_hits"]) == 1
+
+    original = routes.load_edges
+
+    def load_edges_then_commit(db, *a, **kw):
+        edges = original(db, *a, **kw)
+        if not getattr(load_edges_then_commit, "done", False):
+            load_edges_then_commit.done = True
+            # 另一连接提交新证据：A→X→B，X 会把 A、B 隔开
+            other = sqlite3.connect(app.config["DATABASE"], isolation_level=None)
+            other.execute("BEGIN IMMEDIATE")
+            cur = other.execute("INSERT INTO segments (name) VALUES ('S9')")
+            seg_id = cur.lastrowid
+            other.executemany(
+                "INSERT INTO segment_rows (segment_id, position, page_id) VALUES (?, ?, ?)",
+                [(seg_id, i + 1, p) for i, p in enumerate(["A", "X", "B"])],
+            )
+            other.execute("COMMIT")
+            other.close()
+        return edges
+
+    monkeypatch.setattr(routes, "load_edges", load_edges_then_commit)
+    payload = search(c, "abcd").get_json()
+    # 快照里 X 尚未入库，A、B 仍紧挨；若不包事务则会看到 X 夹在中间
+    assert len(payload["cross_page_hits"]) == 1
+
+    monkeypatch.setattr(routes, "load_edges", original)
+    assert search(c, "abcd").get_json()["cross_page_hits"] == []
+
+
+# ---------- 紧邻判定：与枚举页序的结果逐一对照 ----------
+
+def test_adjacency_matches_exhaustive_enumeration():
+    import itertools
+    import random
+
+    from app.logic import Edge, adjacent_in_all_orders
+
+    def linear_extensions(nodes, edges):
+        result = []
+        for perm in itertools.permutations(nodes):
+            pos = {p: i for i, p in enumerate(perm)}
+            if all(pos[e.former] < pos[e.latter] for e in edges):
+                result.append(perm)
+        return result
+
+    rng = random.Random(20261122)
+    for n in range(2, 7):
+        nodes = [f"P{i}" for i in range(n)]
+        pairs = list(itertools.combinations(nodes, 2))
+        for _ in range(60):
+            chosen = rng.sample(pairs, rng.randint(0, min(len(pairs), 7)))
+            edges = [Edge(a, b, f"{a}<{b}") for a, b in chosen]
+            exts = linear_extensions(nodes, edges)
+            if not exts:
+                continue
+            for a, b in pairs:
+                # 枚举：所有页序里 a、b 都须同向紧挨；方向也须一致
+                dirs = set()
+                for ext in exts:
+                    ia, ib = ext.index(a), ext.index(b)
+                    if abs(ia - ib) != 1:
+                        dirs = set()
+                        break
+                    dirs.add("a_before_b" if ia < ib else "b_before_a")
+                direction = next(iter(dirs)) if len(dirs) == 1 else None
+                ok, _, got = adjacent_in_all_orders(a, b, nodes, edges)
+                assert ok == (direction is not None), (nodes, edges, a, b)
+                if ok:
+                    assert got == direction, (nodes, edges, a, b, got, direction)

@@ -50,6 +50,28 @@
   <p class="hint">同一对先后重报只记一次；若与现有证据成环，退回并指出涉及证据。</p>
 </section>
 
+<section>
+  <h2>上传转写</h2>
+  <form id="transcript-form">
+    <input type="file" name="file" accept=".csv,text/csv" required>
+    <button type="submit">上传 / 按页替换</button>
+  </form>
+  <p class="hint">CSV 每行「纸页标识,转写全文」（可有表头，正文含逗号或换行时按 CSV 引号规则）。
+     只替换本批涉及的纸页。任一行纸页未知或同批重号，整批退回、一条不入库。</p>
+</section>
+
+<section>
+  <h2>转写检索</h2>
+  <form id="search-form">
+    <input name="q" placeholder="按字面查找的原文片段" required style="width: 60%">
+    <button type="submit">检索</button>
+  </form>
+  <p class="hint">按字面匹配，列出命中片段与纸页标识。跨页命中只认「前页末尾接后页开头」，
+     且要求这两页在所有符合当前证据的页序里都同向紧挨；未转写的纸页也参与页序判定，
+     全册页序未定时仍给出页内命中与确定的跨页命中。</p>
+  <div id="search-result"></div>
+</section>
+
 <div id="msg"></div>
 
 <section>
@@ -62,13 +84,25 @@
   <div id="notes">（无）</div>
 </section>
 
+<section>
+  <h2>已入库转写</h2>
+  <div id="transcripts">（无）</div>
+</section>
+
 <script>
 const $ = (id) => document.getElementById(id);
 
 function showMsg(payload, status) {
   const box = $("msg");
-  let text = payload.error || payload.message ||
-             (payload.ok ? `已入库（扫描段 ${payload.segment ?? ""}，${payload.rows ?? ""} 行）` : "失败");
+  let text;
+  if (payload.error) text = payload.error;
+  else if (payload.message) text = payload.message;
+  else if (payload.pages) text = `已入库 ${payload.pages.length} 页转写：${payload.pages.join("、")}`;
+  else if (payload.ok) text = `已入库（扫描段 ${payload.segment ?? ""}，${payload.rows ?? ""} 行）`;
+  else text = "失败";
+  if (payload.problems && payload.problems.length && !text.includes("·")) {
+    text += "\n" + payload.problems.map(p => "· " + p).join("\n");
+  }
   if (payload.cycle && payload.cycle.length) {
     text += "\n环上涉及的证据：\n" + payload.cycle.map(c => "· " + c.source).join("\n");
   }
@@ -104,6 +138,13 @@ async function refresh() {
         `<tr><td>${n.id}</td><td>${esc(n.a)}</td><td>${esc(n.b)}</td><td>${n.created_at}</td></tr>`).join("") +
       `</table>`
     : "（无）";
+
+  $("transcripts").innerHTML = s.transcripts.length
+    ? `<table><tr><th>纸页标识</th><th>字数</th><th>更新时间</th></tr>` +
+      s.transcripts.map(t =>
+        `<tr><td>${esc(t.page_id)}</td><td>${t.chars}</td><td>${t.updated_at}</td></tr>`).join("") +
+      `</table>`
+    : "（无）";
 }
 
 function esc(s) {
@@ -130,6 +171,37 @@ $("note-form").addEventListener("submit", async (ev) => {
   showMsg(await r.json(), r.status);
   if (r.ok) ev.target.reset();
   refresh();
+});
+
+$("transcript-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const r = await fetch("/api/transcripts", {method: "POST", body: new FormData(ev.target)});
+  const payload = await r.json();
+  if (payload.problems && payload.problems.length) {
+    payload.error += "\n" + payload.problems.map(p => "· " + p).join("\n");
+  }
+  showMsg(payload, r.status);
+  if (r.ok) ev.target.reset();
+  refresh();
+});
+
+$("search-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const q = new FormData(ev.target).get("q");
+  const r = await fetch("/api/search?q=" + encodeURIComponent(q));
+  const payload = await r.json();
+  if (!r.ok) {
+    $("search-result").innerHTML = `<div class="warn">${esc(payload.error || "检索失败")}</div>`;
+    return;
+  }
+  const block = (title, hits) => hits.length
+    ? `<h3>${title}（${hits.length}）</h3><table>
+         <tr><th>纸页标识</th><th>命中片段</th></tr>` +
+      hits.map(h => `<tr><td>${h.pages.map(esc).join(" → ")}</td>
+        <td><code>${esc(h.snippet)}</code></td></tr>`).join("") + `</table>`
+    : `<h3>${title}（0）</h3>`;
+  $("search-result").innerHTML = block("页内命中", payload.page_hits) +
+    block("跨页命中", payload.cross_page_hits);
 });
 
 refresh();

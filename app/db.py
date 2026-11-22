@@ -22,6 +22,11 @@ CREATE TABLE IF NOT EXISTS notes (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (page_a, page_b)
 );
+CREATE TABLE IF NOT EXISTS transcripts (
+    page_id TEXT PRIMARY KEY,
+    text TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
