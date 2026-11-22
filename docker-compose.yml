@@ -1,0 +1,13 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MSO_DB: /data/manuscript.db
+    volumes:
+      - mso-data:/data
+    restart: unless-stopped
+
+volumes:
+  mso-data:

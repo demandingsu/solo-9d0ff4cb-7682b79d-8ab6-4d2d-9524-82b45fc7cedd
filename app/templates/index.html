@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>手稿编序</title>
+<style>
+  body { font-family: system-ui, "Noto Sans CJK SC", sans-serif; max-width: 960px;
+         margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.5rem; } h2 { font-size: 1.1rem; margin-bottom: .4rem; }
+  section { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+  .hint { color: #666; font-size: .85rem; margin: .4rem 0 0; }
+  #msg { white-space: pre-wrap; border-radius: 8px; padding: .8rem; margin: 1rem 0; display: none; }
+  #msg.ok { display: block; background: #e8f5e9; border: 1px solid #a5d6a7; }
+  #msg.err { display: block; background: #ffebee; border: 1px solid #ef9a9a; }
+  .warn { background: #fff8e1; border: 1px solid #ffe082; border-radius: 8px; padding: .8rem; }
+  .good { background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 8px; padding: .8rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { border: 1px solid #ddd; padding: .3rem .6rem; text-align: left; }
+  input, button { padding: .35rem .5rem; margin: .15rem 0; }
+  ol.order { columns: 4; }
+</style>
+</head>
+<body>
+<h1>手稿编序</h1>
+
+<section>
+  <h2>阅览目录</h2>
+  <div id="status">载入中…</div>
+</section>
+
+<section>
+  <h2>上传扫描段</h2>
+  <form id="seg-form">
+    <input name="name" placeholder="扫描段名称，如 S1" required>
+    <input type="file" name="file" accept=".csv,text/csv" required>
+    <button type="submit">上传 / 重扫替换</button>
+  </form>
+  <p class="hint">CSV 每行一个纸页标识（取第一列，可有表头），行序即该段扫描顺序。
+     同名段重传只替换本段证据，其余页与补记保留；若与他段证据成环，整笔退回。</p>
+</section>
+
+<section>
+  <h2>补记两页先后</h2>
+  <form id="note-form">
+    <input name="a" placeholder="先页标识" required> 先于
+    <input name="b" placeholder="后页标识" required>
+    <button type="submit">补记</button>
+  </form>
+  <p class="hint">同一对先后重报只记一次；若与现有证据成环，退回并指出涉及证据。</p>
+</section>
+
+<div id="msg"></div>
+
+<section>
+  <h2>扫描段</h2>
+  <div id="segments">（无）</div>
+</section>
+
+<section>
+  <h2>补记</h2>
+  <div id="notes">（无）</div>
+</section>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function showMsg(payload, status) {
+  const box = $("msg");
+  let text = payload.error || payload.message ||
+             (payload.ok ? `已入库（扫描段 ${payload.segment ?? ""}，${payload.rows ?? ""} 行）` : "失败");
+  if (payload.cycle && payload.cycle.length) {
+    text += "\n环上涉及的证据：\n" + payload.cycle.map(c => "· " + c.source).join("\n");
+  }
+  if (payload.undetermined_pair) {
+    text += `\n先后待定的一对页：${payload.undetermined_pair[0]} 与 ${payload.undetermined_pair[1]}`;
+  }
+  box.textContent = text;
+  box.className = status >= 400 ? "err" : "ok";
+}
+
+async function refresh() {
+  const s = await (await fetch("/api/state")).json();
+
+  $("status").innerHTML = s.unique
+    ? `<div class="good">现有证据可排出唯一页序（共 ${s.order.length} 页）。
+       <a href="/catalog.csv">下载阅览目录 CSV</a></div>
+       <ol class="order">${s.order.map(p => `<li>${esc(p)}</li>`).join("")}</ol>`
+    : `<div class="warn">现有证据排不出唯一页序，阅览目录已暂停提供。<br>
+       先后待定的一对页：<b>${esc(s.undetermined_pair[0])}</b> 与
+       <b>${esc(s.undetermined_pair[1])}</b>（可能不止这一对）。</div>`;
+
+  $("segments").innerHTML = s.segments.length
+    ? `<table><tr><th>段名</th><th>行数</th><th>页序</th><th>最近入库</th></tr>` +
+      s.segments.map(g =>
+        `<tr><td>${esc(g.name)}</td><td>${g.pages.length}</td>
+         <td>${g.pages.map(esc).join(" → ")}</td><td>${g.uploaded_at}</td></tr>`).join("") +
+      `</table>`
+    : "（无）";
+
+  $("notes").innerHTML = s.notes.length
+    ? `<table><tr><th>#</th><th>先</th><th>后</th><th>登记时间</th></tr>` +
+      s.notes.map(n =>
+        `<tr><td>${n.id}</td><td>${esc(n.a)}</td><td>${esc(n.b)}</td><td>${n.created_at}</td></tr>`).join("") +
+      `</table>`
+    : "（无）";
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+$("seg-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const r = await fetch("/api/segments", {method: "POST", body: new FormData(ev.target)});
+  showMsg(await r.json(), r.status);
+  if (r.ok) ev.target.reset();
+  refresh();
+});
+
+$("note-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const r = await fetch("/api/notes", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({a: fd.get("a"), b: fd.get("b")}),
+  });
+  showMsg(await r.json(), r.status);
+  if (r.ok) ev.target.reset();
+  refresh();
+});
+
+refresh();
+</script>
+</body>
+</html>
